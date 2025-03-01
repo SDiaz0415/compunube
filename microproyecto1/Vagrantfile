@@ -1,0 +1,198 @@
+Vagrant.configure("2") do |config|
+  # Configuración del balanceador de carga
+  config.vm.define "balanceador" do |balanceador|
+    balanceador.vm.box = "ubuntu/bionic64"
+    balanceador.vm.hostname = "balanceador"
+    balanceador.vm.network "private_network", ip: "192.168.56.10"
+
+    balanceador.vm.provision "shell", inline: <<-SHELL
+      sudo apt-get update
+      sudo apt-get install -y haproxy unzip
+
+      # Instalar Consul
+      CONSUL_VERSION="1.15.2"
+      wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+      unzip consul_${CONSUL_VERSION}_linux_amd64.zip
+      sudo mv consul /usr/local/bin/
+      sudo rm -f consul_${CONSUL_VERSION}_linux_amd64.zip
+
+      # Crear el servicio systemd para Consul
+      sudo useradd --system --home /etc/consul.d --shell /bin/false consul
+      sudo mkdir -p /etc/consul.d /var/lib/consul
+      sudo chown -R consul:consul /etc/consul.d /var/lib/consul
+
+      cat <<EOF | sudo tee /etc/systemd/system/consul.service
+[Unit]
+Description=Consul Agent
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+User=consul
+Group=consul
+ExecStart=/usr/local/bin/consul agent -server -bootstrap-expect=1 -ui -bind=192.168.56.10 -client=0.0.0.0 -data-dir=/var/lib/consul -config-dir=/etc/consul.d
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      sudo chown -R consul:consul /var/lib/consul
+      sudo chmod -R 750 /var/lib/consul
+
+      sudo systemctl daemon-reload
+      sudo systemctl enable consul
+      sudo systemctl start consul
+
+      # Configuración de HAProxy
+      cat <<EOF | sudo tee /etc/haproxy/haproxy.cfg
+      global
+          log /dev/log local0
+          maxconn 4096
+          daemon
+
+      defaults
+          log global
+          option httplog
+          option dontlognull
+          timeout connect 5000ms
+          timeout client 50000ms
+          timeout server 50000ms
+
+      frontend http_front
+          bind *:80
+          mode tcp
+          default_backend web_servers
+
+      backend web_servers
+          mode http
+          balance roundrobin
+          stats enable
+          stats auth admin:admin
+          stats uri /haproxy?stats
+          server web1 192.168.56.11:3000 check
+          server web2 192.168.56.12:3000 check
+          errorfile 503 /etc/haproxy/errors/503.http
+
+      listen stats
+          bind *:8404
+          mode http
+          stats enable
+          stats uri /stats
+          stats refresh 10s
+EOF
+
+      # Configurar página de error 503
+      sudo mkdir -p /etc/haproxy/errors
+      cat <<EOF | sudo tee /etc/haproxy/errors/503.http
+HTTP/1.1 503 Service Unavailable
+Content-Type: text/html
+Cache-Control: no-cache
+Connection: close
+
+<html>
+<head><title>Servicio No Disponible</title></head>
+<body>
+<h1>503 - Servicio No Disponible</h1>
+<p>Lo sentimos, en este momento no hay servidores disponibles para atender su solicitud.</p>
+</body>
+</html>
+EOF
+
+      sudo systemctl enable haproxy
+      sudo systemctl restart haproxy
+    SHELL
+  end
+
+  # Configuración de Web1 y Web2
+  ["web1", "web2"].each do |name|
+    config.vm.define name do |web|
+      web.vm.box = "ubuntu/bionic64"
+      web.vm.hostname = name
+      ip = name == "web1" ? "192.168.56.11" : "192.168.56.12"
+      web.vm.network "private_network", ip: ip
+      web.vm.provision "shell", inline: <<-SHELL
+        sudo apt update && sudo apt upgrade -y
+        curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -
+        sudo apt update
+        sudo apt-get install -y nodejs
+        sudo apt-get install -y unzip
+        echo "node version"
+        node -v
+        echo "npm version"
+        npm -v
+
+        # Instalar Consul
+        CONSUL_VERSION="1.15.2"
+        wget https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+        unzip consul_${CONSUL_VERSION}_linux_amd64.zip
+        sudo mv consul /usr/local/bin/
+        sudo rm -f consul_${CONSUL_VERSION}_linux_amd64.zip
+
+        sudo useradd --system --home /etc/consul.d --shell /bin/false consul
+        sudo mkdir -p /etc/consul.d /var/lib/consul
+        sudo chown -R consul:consul /etc/consul.d /var/lib/consul
+
+        cat <<EOF | sudo tee /etc/systemd/system/consul.service
+[Unit]
+Description=Consul Agent
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+User=consul
+Group=consul
+ExecStart=/usr/local/bin/consul agent -client=0.0.0.0 -bind=#{ip} -retry-join=192.168.56.10 -data-dir=/var/lib/consul -config-dir=/etc/consul.d
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable consul
+        sudo systemctl start consul
+
+        # Configurar aplicación Node.js
+        sudo mkdir -p /home/vagrant/webapp
+        cat <<EOF | sudo tee /home/vagrant/webapp/server.js
+const http = require('http');
+const hostname = '0.0.0.0';
+const port = 3000;
+const serverName = "#{name}";
+
+const server = http.createServer((req, res) => {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain');
+  res.end('¡Hola desde ' + serverName + '!');
+});
+
+server.listen(port, hostname, () => {
+  console.log('Servidor corriendo en http://0.0.0.0:3000');
+});
+EOF
+
+        sudo chmod +x /home/vagrant/webapp/server.js
+
+        cat <<EOF | sudo tee /etc/consul.d/web-service.json
+{
+  "service": {
+    "name": "web",
+    "port": 3000,
+    "check": {
+      "http": "http://localhost:3000",
+      "interval": "10s"
+    }
+  }
+}
+EOF
+        sudo systemctl restart consul
+
+        # Instalar PM2 para manejar procesos Node.js
+        sudo npm install -g pm2
+        cd /home/vagrant/webapp && pm2 start server.js
+        pm2 startup systemd
+        pm2 save
+      SHELL
+    end
+  end
+end

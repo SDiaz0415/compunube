@@ -1,0 +1,14 @@
+config:
+  target: "http://192.168.56.10"
+  phases:
+    - duration: 60  # Duración de 60 segundos
+      arrivalRate: 5  # Comienza con 5 usuarios por segundo
+      rampTo: 20  # Incrementa gradualmente hasta 20 usuarios por segundo
+      name: "Incremento gradual de carga"
+    - duration: 120  # Duración de 120 segundos
+      arrivalRate: 20  # Mantiene una tasa constante de 20 usuarios por segundo
+      name: "Carga sostenida alta"
+scenarios:
+  - flow:
+      - get:
+          url: "/"
